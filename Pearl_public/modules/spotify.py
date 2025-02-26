@@ -9,8 +9,8 @@ logging.basicConfig(level=logging.INFO)
 
 # Spotify API Credentials
 SPOTIFY_CONFIG = {
-    "client_id": "5b03944c24434f9c8e3f1a41e3883eed",
-    "client_secret": "4edf3fe3a69d4f94ab64a1544f6dcab3",
+    "client_id": "",
+    "client_secret": "",
     "redirect_uri": "http://localhost:8888/callback",
     "scope": "user-modify-playback-state user-read-playback-state user-read-currently-playing app-remote-control"
 }
