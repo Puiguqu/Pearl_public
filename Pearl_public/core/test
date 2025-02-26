@@ -1,0 +1,239 @@
+"""
+ollama_integration.py
+
+Revised version:
+  - Removes references to ollama.ClientError
+  - Uses a simpler approach to extract the first { ... } block
+    (instead of the (?R) recursive pattern).
+"""
+
+import asyncio
+import logging
+import re
+import json
+
+from config.telegram_settings import CHAT_ID as chat_id
+from core.time_calendar import provide_datetime_context
+from modules.generate_new_function import implement_feature
+from core.modules_loader import available_functions
+
+logging.basicConfig(level=logging.DEBUG)
+
+conversation_history = {}
+
+def jarvis_prompt(user_input, functions_by_modules):
+    """
+    Construct a prompt instructing the LLM to return JSON if calling a function.
+    """
+    try:
+        logging.debug("Constructing jarvis_prompt for input: %s", user_input)
+        all_functions = available_functions()
+        datetime_context = provide_datetime_context()
+
+        function_list_str = []
+        for module_name, func_list in all_functions.items():
+            joined_funcs = "\n".join(f"  - {fn}" for fn in func_list)
+            function_list_str.append(f"{module_name}:\n{joined_funcs}")
+        functions_text = "\n".join(function_list_str)
+
+        prompt = (
+            "You are PEARL - Personalized Efficient Assistant for Routine and Learning.\n"
+            f"The current date/time is: {datetime_context}\n\n"
+            "If you need to call one of the following functions, respond ONLY with JSON in this format:\n"
+            "{\n"
+            '  "function_call": {\n'
+            '    "name": "<function_name>",\n'
+            '    "arguments": {\n'
+            '      "arg1": "...",\n'
+            '      "arg2": "..." \n'
+            "    }\n"
+            "  }\n"
+            "}\n"
+            "If no function is needed, reply with plain text. Do not mix text and JSON.\n\n"
+            "Available functions:\n"
+            f"{functions_text}\n\n"
+            f"User Input: {user_input}"
+        )
+
+        logging.debug("jarvis_prompt constructed:\n%s", prompt)
+        return prompt
+
+    except Exception as exc:
+        logging.error("Error constructing jarvis_prompt: %s", exc)
+        return "Error generating prompt."
+
+
+def extract_json_block(text):
+    """
+    A simpler function to extract the JSON substring:
+      - Finds the FIRST '{' in the text
+      - Finds the LAST '}' in the text
+      - Returns everything in between (including braces)
+    If either is missing or if the last '}' is before the first '{', returns None.
+    """
+    start_index = text.find('{')
+    end_index = text.rfind('}')
+    if start_index == -1 or end_index == -1 or end_index < start_index:
+        return None
+    return text[start_index:end_index+1]
+
+
+def parse_llm_function_call(llm_response):
+    """
+    Parse the LLM response for a JSON function call, using 'extract_json_block'
+    to handle extra text around the JSON.
+
+    Expected JSON structure:
+    {
+      "function_call": {
+         "name": "<function_name>",
+         "arguments": { ... }
+      }
+    }
+    """
+    logging.debug("parse_llm_function_call() received LLM response:\n%s", llm_response)
+    json_block = extract_json_block(llm_response)
+    if not json_block:
+        logging.debug("No JSON block found in LLM response.")
+        return None, None
+
+    logging.debug("Extracted JSON block:\n%s", json_block)
+    try:
+        data = json.loads(json_block)
+        if "function_call" in data:
+            fn_data = data["function_call"]
+            fn_name = fn_data.get("name")
+            fn_args = fn_data.get("arguments", {})
+            logging.info("Parsed function call: %s with arguments=%s", fn_name, fn_args)
+            return fn_name, fn_args
+        else:
+            logging.debug("No 'function_call' key in parsed JSON.")
+            return None, None
+    except (json.JSONDecodeError, TypeError) as e:
+        logging.debug("Failed to parse extracted JSON: %s", e)
+        return None, None
+
+
+async def dispatch_function_call(function_name, arguments):
+    """
+    Dynamically call a function discovered by modules_loader.
+    """
+    logging.info("Dispatching function call: %s(%s)", function_name, arguments)
+    all_funcs = available_functions()
+
+    for module_name, func_list in all_funcs.items():
+        if function_name in func_list:
+            try:
+                logging.debug("Found '%s' in module '%s'; importing and invoking.", function_name, module_name)
+                mod = __import__(module_name, fromlist=[function_name])
+                fn = getattr(mod, function_name)
+                result = fn(**arguments)
+                logging.info("Function '%s' returned: %s", function_name, result)
+                return str(result)
+            except Exception as exc:
+                logging.error("Error calling '%s' in '%s': %s", function_name, module_name, exc)
+                return f"Error executing function '{function_name}': {exc}"
+
+    logging.warning("Function '%s' not found among loaded modules.", function_name)
+    return f"Function '{function_name}' not found among available modules."
+
+
+async def ask_ollama(prompt, model="llama3.2", chat_id=None):
+    """
+    Send 'prompt' to Ollama, parse for JSON function calls, execute if found,
+    and return final text.
+    """
+    import ollama
+
+    logging.debug("ask_ollama() with prompt:\n%s", prompt)
+
+    # Append user prompt to conversation history
+    history = conversation_history.get(chat_id, [])
+    history.append(f"User: {prompt}")
+    conversation_history[chat_id] = history
+
+    # Combine into single conversation text
+    conversation_text = "\n".join(history)
+    logging.debug("Sending conversation to Ollama:\n%s", conversation_text)
+
+    client = ollama.Client()
+
+    # We do up to 3 attempts in case of connection errors
+    retries = 3
+    for attempt in range(retries):
+        try:
+            logging.debug("Ollama generate() attempt %d...", attempt + 1)
+            response = client.generate(model=model, prompt=conversation_text)
+            raw_output = response.get("response", "")
+            logging.debug("Raw LLM output:\n%s", raw_output)
+
+            # Remove <think> tags
+            cleaned_output = re.sub(r"<think>.*?</think>", "", raw_output, flags=re.DOTALL).strip()
+            logging.debug("Cleaned LLM output:\n%s", cleaned_output)
+
+            function_name, fn_args = parse_llm_function_call(cleaned_output)
+            if function_name:
+                logging.info("LLM indicated a function call: %s", function_name)
+                func_result = await dispatch_function_call(function_name, fn_args)
+                final_text = f"(Called function '{function_name}'):\n{func_result}"
+            else:
+                final_text = cleaned_output
+
+            # Update history
+            history.append(f"AI: {final_text}")
+            conversation_history[chat_id] = history
+
+            # Optionally send final_text to Telegram
+            if chat_id:
+                logging.debug("Sending final output to Telegram chat_id=%s", chat_id)
+                from core.telegram_receiver import send_message
+                await send_message(chat_id, final_text)
+
+            logging.info("ask_ollama final output:\n%s", final_text)
+            return final_text
+
+        # Remove reference to ollama.ClientError since it doesn't exist
+        except ConnectionError as e:
+            logging.warning("Connection error to Ollama (attempt %d): %s", attempt + 1, e)
+            if attempt < retries - 1:
+                continue
+            else:
+                return f"Error after multiple attempts: {e}"
+
+        # For any other exception
+        except Exception as e:
+            logging.error("Unhandled exception in ask_ollama (attempt %d): %s", attempt + 1, e)
+            return f"An error occurred: {e}"
+
+    logging.error("No valid response after %d attempts.", retries)
+    return "Failed to get a valid response from the LLM after multiple retries."
+
+
+async def ask_ollama_and_implement(prompt, modules_path="modules"):
+    """
+    For potential new feature code:
+      - ask the LLM
+      - if 'feature_name'/'feature_code' in response, implement them
+      - otherwise fallback
+    """
+    import ollama
+    from internet_search import search_internet
+
+    logging.debug("ask_ollama_and_implement prompt:\n%s", prompt)
+    client = ollama.Client()
+    response = client.generate(model="llama3.2", prompt=prompt)
+
+    logging.debug("Raw LLM dictionary response:\n%s", response)
+    feature_name = response.get("feature_name")
+    feature_code = response.get("feature_code")
+
+    if not feature_name or not feature_code:
+        logging.info("No feature found in LLM response, trying fallback (internet_search).")
+        search_results = search_internet(prompt)
+        if search_results:
+            return f"Performed an internet search. Results:\n{search_results}"
+        return "No code was provided by the LLM and no search results found."
+
+    logging.info("Implementing feature: %s", feature_name)
+    result_msg = await implement_feature(feature_code, feature_name, modules_path)
+    return result_msg
